@@ -1,175 +1,259 @@
-# `ltbpf`
+# ltbpf
 
-Linear-time Bayesian Particle Filter for Rust. A small,
-allocation-free, `no_std`-clean implementation of the standard
-Sequential Importance Resampling (SIR) bootstrap particle filter
-(Gordon, Salmond & Smith 1993), with O(n) multinomial resampling
-delegated to [`ltsis`](https://github.com/BartMassey/ltsis).
+A small Rust crate for **Bayesian particle filtering**. Given a hidden
+state that evolves over time and a stream of noisy observations of
+it, a particle filter gives you a running estimate of where the state
+probably is.
 
-```rust
-let mut filter = ParticleFilter::new(
-    Buffers { particles_curr, particles_next, weights, indices },
-    |rng, state| propagate_one_step(rng, state),
-    |state, obs| likelihood(state, obs),
-);
+`ltbpf` is built for the cases where a Kalman filter is awkward —
+nonlinear dynamics, discontinuous sensors, non-Gaussian noise,
+or "I don't want to tune covariance matrices." It is small, fast,
+allocation-free, and works on embedded targets (Cortex-M4F-class
+microcontrollers and up).
 
-for obs in observations {
-    let StepResult { ess, resampled, .. } =
-        filter.step(&mut rng, &obs)?;
-    let centroid = weighted_mean(
-        filter.particles(), filter.weights(),
-        |s| [Coord::Linear(s.x), Coord::Linear(s.y)],
-    );
-    // ... use the estimate ...
-}
-```
+## Why a particle filter?
 
-## Why a particle filter (vs a Kalman filter)
+A particle filter represents a probability distribution by a cloud of
+sampled hypotheses ("particles"). Each step it does two things:
 
-`ltbpf` is for the cases where Kalman is awkward:
+1. **Move each particle forward in time** using your model of how
+   the state evolves (`propagate`).
+2. **Re-weight the particles** by how plausible each one looks given
+   the latest observation (`weight_update`), occasionally throwing
+   out low-weight ones and duplicating high-weight ones
+   (*resampling*).
 
-- **Less tuning.** A Kalman filter wants process- and
-  measurement-noise covariance matrices `Q` and `R`. A BPF wants a
-  sample-from-the-transition function and a
-  likelihood-of-observation function. Both are usually natural to
-  write directly, with no covariance estimation step in between.
-- **Nonlinear dynamics or observations.** Kalman needs linearity;
-  the Extended Kalman Filter linearizes but loses accuracy when the
-  nonlinearity is strong. BPF handles arbitrary nonlinearity for
-  free — your `propagate` and `weight_update` closures can compute
-  anything.
-- **Discontinuous sensors.** Proximity flags, range clipping,
-  wrap-around bearings, occlusion gates — all break Kalman's
-  smoothness assumptions. BPF doesn't care; the likelihood function
-  evaluates whatever sensor model you have.
-- **Non-Gaussian noise.** Heavy-tailed, skewed, or
-  compactly-supported noise distributions break Kalman's
-  Gaussian-conjugate update. BPF takes whatever pdf you code up.
+The weighted cloud at any point is your posterior over the state.
 
-If your model is genuinely linear-Gaussian, use a Kalman filter:
-it'll give the same answer with less compute. This crate's bundled
-[vehicle demo](examples/vehicle.rs) is in fact linear-Gaussian, so
-that the test suite can compare BPF output against an analytic
-Kalman filter on the same observations (see
-[`tests/convergence_kalman.rs`](tests/convergence_kalman.rs)).
+Where a Kalman filter wants `Q` and `R` covariance matrices and
+assumes linearity plus Gaussian noise, a particle filter wants two
+functions:
 
-## What's in the box
+| If you have…                         | …a Kalman filter wants | …`ltbpf` wants |
+|--------------------------------------|------------------------|----------------|
+| A way to step the state forward      | linear matrix `F` + covariance `Q` | a `propagate` closure |
+| A way to score an observation        | linear matrix `H` + covariance `R` | a `weight_update` closure |
+| Nonlinear dynamics                   | needs the EKF/UKF dance | works as-is |
+| Non-Gaussian or weird sensor noise   | gives wrong answers     | works as-is |
+| Lots of compute budget               | not strictly necessary  | a particle cloud is more compute |
 
-- **`ParticleFilter`** — the SIR loop. Holds references to
-  caller-owned buffers; no allocation; works the same on a
-  workstation and a Cortex-M4F. Adaptive resampling triggered by
-  effective sample size (default threshold `ESS < 0.5n`, after Liu
-  & Chen 1995); switchable resampling backend (`ResamplerKind::{Buffered,
-  Streaming}`).
-- **`weighted_mean`** — weighted centroid estimator with
-  per-dimension `Coord::{Linear, Angular}` tagging. Angular
-  dimensions use an online shortest-rotation mean (no `sin`/`cos`/
-  `atan2` on the hot path).
-- **`map_particle`** — argmax-of-weights, the discrete-MAP
-  estimate.
-- **`Buffers`** — the four caller-owned slices: two particle
-  arrays (current and scratch), weights, and resample-index scratch.
+If your problem is linear with Gaussian noise, prefer a Kalman filter:
+it'll give the same answer faster. If it isn't, read on.
 
-Out of scope (deliberately): multimodal state estimation via
-spatial clustering, particle rejuvenation / roughening,
-Rao-Blackwellized filters, smoothing, joint parameter-state
-inference. See [`ltbpf-plan.md`](ltbpf-plan.md) for the full
-rationale.
-
-## Features
+## Installing
 
 ```toml
 [dependencies]
 ltbpf = { git = "https://github.com/BartMassey/ltbpf" }
+rand = "0.10"
+rand_distr = "0.6"
 ```
 
-Cargo features (exactly one of `std`/`libm` must be enabled):
+The library is `no_std`-compatible. For bare-metal targets, disable
+default features and enable `libm`:
 
-- `std` (default) — pulls `ltsis/std`, uses inherent
-  `f32`/`f64` math.
-- `libm` — routes transcendental math through the `libm`
-  crate. Use this on bare-metal `no_std` targets.
+```toml
+ltbpf = { git = "https://github.com/BartMassey/ltbpf",
+          default-features = false, features = ["libm"] }
+```
 
-The library proper is `no_std`-clean; the bundled examples are
-gated behind `std` (they use `println!` and `Vec`).
+## A complete example
 
-## Examples
+Tracking a hidden scalar `x` that drifts randomly, given noisy
+measurements of it:
+
+```rust
+use ltbpf::{weighted_mean, Buffers, Coord, ParticleFilter};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
+
+const N: usize = 1000; // number of particles
+
+let mut rng = SmallRng::seed_from_u64(42);
+let proc_noise = Normal::new(0.0_f32, 0.3).unwrap();
+let obs_sigma  = 1.0_f32;
+
+// 1. Four caller-owned buffers, all the same length.
+let mut p_curr: Vec<f32> =
+    (0..N).map(|_| Normal::new(0.0, 2.0).unwrap().sample(&mut rng))
+          .collect();
+let mut p_next  = vec![0.0_f32; N];
+let mut weights = vec![1.0_f32; N];
+let mut indices = vec![0_u32;  N];
+
+// 2. Build the filter: pass in the buffers and your two model
+//    closures.
+let mut filter = ParticleFilter::new(
+    Buffers {
+        particles_curr: &mut p_curr,
+        particles_next: &mut p_next,
+        weights:        &mut weights,
+        indices:        &mut indices,
+    },
+    // propagate: how does a particle move from one step to the next?
+    |rng, x: &f32| x + proc_noise.sample(rng),
+
+    // weight_update: how plausible is this particle given the latest
+    // observation? (Up to a normalization constant — `ltbpf`
+    // rescales between steps, so absolute scale is irrelevant.)
+    |x: &f32, &obs: &f32| {
+        let r = (obs - x) / obs_sigma;
+        (-0.5 * r * r).exp() // Gaussian likelihood
+    },
+);
+
+// 3. Feed in observations one at a time.
+for &obs in &[1.0_f32, 1.5, 2.1, 2.8, 3.6] {
+    let result = filter.step(&mut rng, &obs).unwrap();
+
+    // 4. Get a point estimate from the cloud.
+    let centroid = weighted_mean(
+        filter.particles(), filter.weights(),
+        |x| [Coord::Linear(*x)],
+    );
+    let Coord::Linear(estimate) = centroid[0] else { unreachable!() };
+
+    println!("obs={obs}  estimate={estimate:.3}  ess={:.1}", result.ess);
+}
+```
+
+Output (approximate):
 
 ```
-cargo run --release --example vehicle [n] > out.csv
+obs=1.0  estimate=0.51  ess=786.4
+obs=1.5  estimate=0.98  ess=920.1
+obs=2.1  estimate=1.47  ess=918.6
+obs=2.8  estimate=2.11  ess=912.8
+obs=3.6  estimate=2.83  ess=901.0
+```
+
+The estimate trails the observations because the filter is fusing
+each measurement with the running posterior; this is the point of a
+filter.
+
+## The two functions you write
+
+**`propagate(rng, &state) -> state`** samples one timestep of how the
+state changes. Include process noise here — the cloud needs to spread
+out a little each step so it can react to new evidence.
+
+**`weight_update(&state, &obs) -> f32`** returns the likelihood of
+the observation given that state, up to a constant. The standard
+choice is a Gaussian centered on the particle's predicted observation:
+
+```rust
+fn likelihood(particle: &State, obs: &Obs) -> f32 {
+    let r = (obs.value - predicted(particle)) / sigma;
+    (-0.5 * r * r).exp()
+}
+```
+
+For more complicated sensors, multiply likelihoods or build whatever
+distribution fits your model. The number just has to be non-negative
+and finite.
+
+## Getting an estimate
+
+The filter holds the weighted cloud; you turn that cloud into a
+single number (or vector) with one of two estimators:
+
+- **`weighted_mean(particles, weights, project)`** — the weighted
+  centroid. Each dimension is tagged `Coord::Linear` or
+  `Coord::Angular`; angular dimensions are averaged correctly across
+  the `±π` wrap.
+
+- **`map_particle(particles, weights)`** — returns the highest-weight
+  particle. Less smooth than `weighted_mean`, but it returns *one of
+  the modes* rather than averaging across them — handy as a sanity
+  check when you suspect multimodality.
+
+Don't use `weighted_mean` on a sharply multimodal posterior — the
+"centroid of two clusters" is the midpoint between them, which is
+usually nowhere any particle actually is. (`ltbpf` doesn't include a
+clustering tool. If you need one, see the discussion in the design
+plan.)
+
+## Tuning knobs
+
+```rust
+let filter = ParticleFilter::new(buffers, propagate, likelihood)
+    .with_ess_threshold(0.5)          // default
+    .with_resampler(ResamplerKind::Buffered);  // default
+```
+
+- **`with_ess_threshold(t)`** — when the effective sample size drops
+  below `t · n`, the filter resamples. The default `0.5` is the
+  Liu & Chen (1995) recommendation and works for most problems.
+- **`with_resampler(kind)`** — `Buffered` (the default, faster) or
+  `Streaming` (saves a bit of scratch on `no_std` targets).
+
+## What it gives you back
+
+`filter.step(&mut rng, &obs)` returns either:
+
+- **`Ok(StepResult)`** — diagnostics for the step: the effective
+  sample size, whether the filter resampled, the maximum weight
+  (useful for detecting "is the filter still tracking?"), …
+- **`Err(StepError)`** — either every particle's weight went to zero
+  (the cloud has lost the state, e.g. a sensor failure) or your
+  `weight_update` produced NaN/inf/negative (a bug in the
+  likelihood). In either case the cloud is no longer trustworthy —
+  reinitialize from the prior or signal upstream.
+
+## Worked examples in the repo
+
+```sh
+cargo run --release --example vehicle > out.csv
 cargo run --release --example compare_resamplers > resamplers.csv
 ```
 
-- **`vehicle`** — 2D near-constant-velocity vehicle with noisy
-  GPS + IMU. Mirrors Figure 4 of Massey (ICASSP 2008). 7-column
-  CSV: `step, truth_x, truth_y, est_x, est_y, ess, err`.
-- **`compare_resamplers`** — drives the vehicle BPF loop with
-  three resamplers (`ltsis::sample_indices_buffered`,
-  `ltsis::sample_indices`, and a textbook prefix-sum +
-  binary-search baseline) at several values of N. CSV columns:
-  `n, resampler, total_ms, per_step_us`. At N = 30,000 on a
-  desktop x86: ltsis buffered ~1.27 ms/step, naive ~2.98 ms/step.
+- **`vehicle`** — a 2-D vehicle with noisy GPS (position) and IMU
+  (velocity) sensors. Writes a CSV of truth, estimate, ESS, and
+  tracking error per timestep. ~90 ms for 1 000 particles × 1 000
+  steps on a desktop x86.
 
-## Tests
+- **`compare_resamplers`** — the same vehicle filter run with three
+  different resamplers (`ltsis` buffered, `ltsis` streaming, and a
+  textbook prefix-sum + binary-search baseline) at several values of
+  N. Demonstrates the `ltsis` speedup over the standard
+  implementation — about 2.3× at N = 30 000.
 
-```
+## Running the tests
+
+```sh
 cargo test --release
 ```
 
-Three layers:
+The test suite has three layers:
 
-- `tests/mechanics.rs` — bookkeeping invariants: ESS tabular
-  checks, weight normalization, resample reset, SIS carry-over,
-  `StepError` paths, streaming resampler.
-- `tests/estimators.rs` — `weighted_mean` (linear 2D centroid,
-  angular cluster near 0, angular ±π straddle, asymmetric weights,
-  permutation invariance) and `map_particle` (argmax + tiebreak).
-- `tests/convergence_kalman.rs` — 50 fixed-seed trials of 100
-  steps on a 1D linear-Gaussian random walk; verifies the BPF
-  weighted mean tracks the analytic Kalman mean to within 0.5
-  Kalman SDs averaged across the run (achieved value with N=500
-  particles: ~0.06 Kalman SDs).
+- **`tests/mechanics.rs`** — filter bookkeeping (weight normalization,
+  ESS, resample reset, the streaming resampler, error variants).
+- **`tests/estimators.rs`** — `weighted_mean` (linear 2-D, angular
+  near 0, angular straddling ±π, asymmetric, permutation invariance)
+  and `map_particle`.
+- **`tests/convergence_kalman.rs`** — runs the BPF and an analytic
+  Kalman filter on the same 1-D linear-Gaussian random walk across
+  50 trials; the BPF mean tracks Kalman within ~0.06 Kalman SDs.
 
-## Implementation notes
+## References
 
-- **Weights are kept in linear space**, max-normalized every step
-  so the largest weight is exactly `1.0`. This trades one
-  normalization pass per step for the per-particle `expf` cost of
-  working in log space — worthwhile on Cortex-M4F (~50–100 cycles
-  per `expf`); the dynamic range concern is mitigated by adaptive
-  resampling plus the running max-normalize.
-- **`step()` returns `Result<StepResult, StepError>`.**
-  `StepResult` carries `max_weight`, `sum_w`, `sum_w_squared`,
-  `ess`, and `resampled`; `StepError` is `AllWeightsZero` or
-  `NonFiniteWeight`. Buffer-length mismatch and zero-particle
-  cases are panics (programmer errors).
-- **`S: Clone`, not `Copy`.** Gather costs one clone per
-  resampled particle (unavoidable — multiple output slots can come
-  from the same input slot). For heavy state, use `Arc<HeavyThing>`
-  so clone is a refcount bump.
+- Gordon, Salmond & Smith (1993). The bootstrap particle filter (the
+  algorithm this crate implements).
+- Kong, Liu & Wong (1994). The effective sample size formula.
+- Liu & Chen (1995). Adaptive-resampling threshold.
+- Doucet & Johansen (2008). *A tutorial on particle filtering and
+  smoothing: fifteen years later.* The standard tutorial reference.
 
-## Citations
+For the linear-time resampling primitive: [`ltsis`].
 
-For the SIR loop and ESS:
-
-- Gordon, Salmond & Smith (1993), "Novel approach to nonlinear/
-  non-Gaussian Bayesian state estimation," *IEE Proceedings F*,
-  140(2), 107–113.
-- Kong, Liu & Wong (1994), "Sequential imputations and Bayesian
-  missing data problems," *JASA* 89(425), 278–288. Original ESS
-  formula.
-- Liu & Chen (1995/1998), adaptive-resampling threshold.
-- Del Moral, Doucet & Jasra (2012), "On adaptive resampling
-  strategies for sequential Monte Carlo methods," *Bernoulli*
-  18(1), 252–278.
-- Doucet & Johansen (2008), "A tutorial on particle filtering and
-  smoothing: fifteen years later," in *Handbook of Nonlinear
-  Filtering*, Oxford UP. The standard tutorial reference.
-
-For the linear-time resampling primitive:
-
-- See [`ltsis`](https://github.com/BartMassey/ltsis).
+[`ltsis`]: https://github.com/BartMassey/ltsis
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either of:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.
