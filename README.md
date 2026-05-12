@@ -1,4 +1,5 @@
-# ltbpf
+# ltbpf: linear-time Bayesian Particle Filtering
+Bart Massey and Claude Code 2026
 
 A small Rust crate for **Bayesian particle filtering**. Given a hidden
 state that evolves over time and a stream of noisy observations of
@@ -224,6 +225,17 @@ cargo run --release --example compare_resamplers > resamplers.csv
   tracking error over time, and effective sample size over time.
   Pass an extra path argument to either script to save the figure
   to a PNG instead of opening a window.
+
+  ![Vehicle demo output](vehicle.png)
+
+  *A representative run: 1 000 particles, 1 000 steps, seed
+  `0xC0FFEE`. Top panel — the truth trajectory (blue) and the
+  filter's weighted-mean estimate (orange), nearly overlapping after
+  the initial convergence. Middle — Euclidean tracking error, which
+  drops from ~4 m at startup to ~0.3 m once the cloud has locked
+  on. Bottom — effective sample size; the filter resamples when
+  this dips, which keeps it bouncing in a healthy range below
+  N = 1 000.*
 
 - **`compare_resamplers`** — the same vehicle filter run with three
   different resamplers (`ltsis` buffered, `ltsis` streaming, and a
