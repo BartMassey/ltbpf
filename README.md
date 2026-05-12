@@ -213,6 +213,18 @@ cargo run --release --example compare_resamplers > resamplers.csv
   tracking error per timestep. ~90 ms for 1 000 particles × 1 000
   steps on a desktop x86.
 
+  To visualize the result, either:
+
+  ```sh
+  python3 examples/plot.py out.csv               # matplotlib
+  gnuplot -c examples/plot.gp out.csv            # gnuplot
+  ```
+
+  Both produce a three-panel figure: 2-D tracks (truth vs estimate),
+  tracking error over time, and effective sample size over time.
+  Pass an extra path argument to either script to save the figure
+  to a PNG instead of opening a window.
+
 - **`compare_resamplers`** — the same vehicle filter run with three
   different resamplers (`ltsis` buffered, `ltsis` streaming, and a
   textbook prefix-sum + binary-search baseline) at several values of
