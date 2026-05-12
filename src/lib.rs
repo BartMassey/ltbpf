@@ -301,3 +301,167 @@ where
         })
     }
 }
+
+// ===========================================================================
+// Estimators
+// ===========================================================================
+
+/// Per-dimension kind tag for projected state coordinates.
+///
+/// `Linear`: ordinary real-valued dimension; arithmetic weighted mean.
+/// `Angular`: angle in radians, conventionally in `(-π, π]`; weighted
+/// mean computed via online shortest-rotation updates (no
+/// `sin`/`cos`/`atan2` on the hot path).
+///
+/// `#[non_exhaustive]` so future variants (closed intervals other than
+/// `(-π, π]`, manifold-valued coordinates) can be added without
+/// breaking SemVer-major.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum Coord {
+    Linear(f32),
+    Angular(f32),
+}
+
+/// Weighted centroid of `n` particles projected through `project` to a
+/// `[Coord; D]` array per particle. Each output dimension is the
+/// weighted mean of the corresponding input dimension, computed
+/// according to its `Coord` variant.
+///
+/// The output adopts the variant of *the first particle's* projection
+/// at each dimension. The caller is expected to return the same
+/// variant sequence for every particle; mismatched variants are not
+/// checked and would silently mix arithmetic and angular accumulation.
+///
+/// # Algorithm
+///
+/// - `Coord::Linear` dimensions: ordinary weighted arithmetic mean,
+///   `Σ wᵢxᵢ / Σ wᵢ`, accumulated in one pass.
+///
+/// - `Coord::Angular` dimensions: online weighted mean of
+///   shortest-rotation displacements. Each new particle's angle is
+///   reduced to `(-π, π]` relative to the current running mean and
+///   added in with weight `wᵢ / Σ_{j≤i} wⱼ`. No transcendentals on the
+///   hot path. Exactly correct, and order-independent, for any
+///   unimodal angular posterior (one where the running mean stays
+///   within π of every sample).
+///
+/// # Panics
+///
+/// Panics if `particles` and `weights` have different lengths, if
+/// `particles` is empty, or if the total weight is non-positive.
+pub fn weighted_mean<S, const D: usize>(
+    particles: &[S],
+    weights: &[f32],
+    project: impl Fn(&S) -> [Coord; D],
+) -> [Coord; D] {
+    assert_eq!(
+        particles.len(),
+        weights.len(),
+        "particle/weight length mismatch"
+    );
+    assert!(
+        !particles.is_empty(),
+        "weighted_mean requires at least one particle"
+    );
+
+    const PI: f32 = core::f32::consts::PI;
+    const TWO_PI: f32 = 2.0 * PI;
+
+    let first_coords = project(&particles[0]);
+    let mut sum_linear = [0.0_f32; D];
+    let mut running_ang = [0.0_f32; D];
+
+    let w0 = weights[0];
+    for k in 0..D {
+        match first_coords[k] {
+            Coord::Linear(x) => sum_linear[k] = w0 * x,
+            Coord::Angular(theta) => running_ang[k] = theta,
+        }
+    }
+    let mut sum_w = w0;
+
+    for i in 1..particles.len() {
+        let w = weights[i];
+        let coords = project(&particles[i]);
+        let sum_w_new = sum_w + w;
+        let scale = if sum_w_new > 0.0 { w / sum_w_new } else { 0.0 };
+        for k in 0..D {
+            match coords[k] {
+                Coord::Linear(x) => sum_linear[k] += w * x,
+                Coord::Angular(theta) => {
+                    let mut d = theta - running_ang[k];
+                    while d > PI {
+                        d -= TWO_PI;
+                    }
+                    while d <= -PI {
+                        d += TWO_PI;
+                    }
+                    running_ang[k] += scale * d;
+                }
+            }
+        }
+        sum_w = sum_w_new;
+    }
+
+    assert!(
+        sum_w > 0.0,
+        "weighted_mean requires positive total weight, got {sum_w}"
+    );
+
+    let mut out = first_coords;
+    for k in 0..D {
+        match first_coords[k] {
+            Coord::Linear(_) => out[k] = Coord::Linear(sum_linear[k] / sum_w),
+            Coord::Angular(_) => {
+                let mut m = running_ang[k];
+                while m > PI {
+                    m -= TWO_PI;
+                }
+                while m <= -PI {
+                    m += TWO_PI;
+                }
+                out[k] = Coord::Angular(m);
+            }
+        }
+    }
+    out
+}
+
+/// Return a clone of the particle with the largest weight.
+///
+/// The "MAP" label is informal: the highest-weight particle is the
+/// mode of the discrete particle approximation to the posterior, not
+/// the continuous-posterior MAP. Useful as a quick-and-dirty estimate
+/// that returns *some* mode of the posterior rather than averaging
+/// across modes (the failure case of [`weighted_mean`] on multimodal
+/// posteriors). For a smoother estimate, KDE-based mode finding is the
+/// principled choice — out of scope here.
+///
+/// Ties are broken by the lower index, matching standard `argmax`
+/// conventions; this matters only when two weights are bit-exact equal.
+///
+/// # Panics
+///
+/// Panics if `particles` and `weights` have different lengths or if
+/// `particles` is empty.
+pub fn map_particle<S: Clone>(particles: &[S], weights: &[f32]) -> S {
+    assert_eq!(
+        particles.len(),
+        weights.len(),
+        "particle/weight length mismatch"
+    );
+    assert!(
+        !particles.is_empty(),
+        "map_particle requires at least one particle"
+    );
+    let mut best = 0usize;
+    let mut best_w = weights[0];
+    for (i, &w) in weights.iter().enumerate().skip(1) {
+        if w > best_w {
+            best = i;
+            best_w = w;
+        }
+    }
+    particles[best].clone()
+}
