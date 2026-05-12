@@ -243,6 +243,64 @@ cargo run --release --example compare_resamplers > resamplers.csv
   N. Demonstrates the `ltsis` speedup over the standard
   implementation — about 2.3× at N = 30 000.
 
+## Benchmarks
+
+```sh
+cargo bench
+```
+
+`benches/bench.rs` uses [Divan] for per-iteration timing with outlier
+rejection. It measures one full `ParticleFilter::step` call on the
+2-D vehicle model from `examples/vehicle.rs`, separately for each
+[`ResamplerKind`], and the two estimators (`weighted_mean`,
+`map_particle`).
+
+Representative numbers from one host (AMD Ryzen 9 3900X, x86-64, single
+thread, release build, `SmallRng`/Xoshiro256++, fastest run reported):
+
+**`ParticleFilter::step` (one full step: propagate + weight + ESS +
+resample-or-swap)**
+
+| N        | Buffered  | Streaming | ns / particle |
+|----------|-----------|-----------|---------------|
+|    300   |   5.4 µs  |   5.3 µs  |     ~18       |
+|  1 000   |  18.1 µs  |  18.1 µs  |     ~18       |
+|  3 000   |  54.7 µs  |  54.1 µs  |     ~18       |
+| 10 000   |  181 µs   |  182 µs   |     ~18       |
+
+Per-step cost is essentially linear in N, as expected (every phase of
+the filter is O(n)). Buffered and Streaming come out within noise of
+each other on x86 — at these sizes the resampler is a small fraction
+of step time, which is dominated by the model's `propagate` closure
+(two `Normal` draws per particle per step). The difference shows up
+in the standalone resampler benchmark below.
+
+**Estimators (single pass over an `n`-particle weighted cloud)**
+
+| N        | `weighted_mean` (4-D linear) | `map_particle` |
+|----------|------------------------------|----------------|
+|    300   |   216 ns                     |   148 ns       |
+|  1 000   |   711 ns                     |   444 ns       |
+|  3 000   |   2.1 µs                     |   1.3 µs       |
+| 10 000   |   7.1 µs                     |   4.4 µs       |
+
+Roughly 0.7 ns per particle per coordinate for `weighted_mean`; 0.4 ns
+per particle for `map_particle`'s simple max-scan.
+
+**Resampler comparison** (separate example, not the divan harness):
+
+```sh
+cargo run --release --example compare_resamplers > resamplers.csv
+```
+
+Compares the `ltsis` buffered and streaming resamplers against a
+textbook prefix-sum + binary-search baseline, inside the same vehicle
+filter. On the same host, at N = 30 000: ltsis buffered ~1.27 ms/step,
+ltsis streaming ~1.51 ms/step, naive ~2.98 ms/step — a ~2.3× speedup
+for the buffered variant.
+
+[Divan]: https://docs.rs/divan
+
 ## Running the tests
 
 ```sh
